@@ -6,6 +6,7 @@ import {
   InventoryStore,
   buildSshCommand,
   buildSshTarget,
+  resolveAuditLogPath,
   resolveInventoryPath,
   withInventoryLock,
 } from "./inventory.js";
@@ -14,6 +15,13 @@ import {
   resolveSecretsPath,
   withSecretsLock,
 } from "./secrets.js";
+import {
+  buildPathsReport,
+  expandHome,
+  loadSshConfigHostAliases,
+} from "./paths.js";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import type { Server } from "./schema.js";
 
 const PKG_NAME = "server-inventory-mcp";
@@ -373,6 +381,102 @@ async function main() {
             (n, arr) => n + arr.length,
             0,
           ),
+        });
+      }),
+  );
+
+  // ---------- paths_report ----------
+  server.registerTool(
+    "paths_report",
+    {
+      title: "Where every file lives",
+      description:
+        "One-shot report of every file path this server cares about: the inventory JSON, the encrypted secrets file (with backend + master-key provider), ~/.ssh/config, the audit log, every identity_file referenced by the inventory (with stat info and a chmod warning if any are world-readable), every ssh_alias used (with whether it actually resolves in ~/.ssh/config), and a per-server breakdown that ties names → ssh target → resolved key path → secret keys. Use this before any operation that needs to find keys / passwords / users on disk.",
+      inputSchema: {},
+    },
+    async () => {
+      const [invSnap, secretsByServer, secretsInfo] = await Promise.all([
+        withInventoryLock(async () => {
+          const s = await InventoryStore.open();
+          return s.all();
+        }),
+        withSecretsLock(() =>
+          defaultSecretsStore().listAll().catch(() => ({}) as Record<string, string[]>),
+        ),
+        defaultSecretsStore().describe(),
+      ]);
+      const report = await buildPathsReport({
+        servers: invSnap,
+        inventoryPath: resolveInventoryPath(),
+        secretsPath: resolveSecretsPath(),
+        secretsBackend: secretsInfo.backend,
+        secretsMasterKey: secretsInfo.master_key,
+        auditLogPath: resolveAuditLogPath(),
+        secretsByServer,
+      });
+      return jsonText(report);
+    },
+  );
+
+  // ---------- validate_inventory ----------
+  server.registerTool(
+    "validate_inventory",
+    {
+      title: "Sanity-check every server",
+      description:
+        "Validate every server in the inventory: that referenced identity_file paths exist on disk and aren't world-readable, that ssh_aliases are defined in ~/.ssh/config, and that each entry is reachable in principle (has ssh_alias OR host). Returns { problems: [{ server, severity, message }] }; empty array means everything checks out.",
+      inputSchema: {},
+    },
+    async () =>
+      withInventoryLock(async () => {
+        const store = await InventoryStore.open();
+        const all = store.all();
+        const sshConfigHosts = (await loadSshConfigHostAliases()).aliases;
+        const problems: Array<{
+          server: string;
+          severity: "error" | "warning";
+          message: string;
+        }> = [];
+        for (const s of all) {
+          if (!s.ssh_alias && !s.host) {
+            problems.push({
+              server: s.name,
+              severity: "error",
+              message: "No ssh_alias and no host — unreachable.",
+            });
+          }
+          if (s.ssh_alias && !sshConfigHosts.has(s.ssh_alias)) {
+            problems.push({
+              server: s.name,
+              severity: "warning",
+              message: `ssh_alias "${s.ssh_alias}" is not defined in ~/.ssh/config; ssh will fall back to using it as a hostname.`,
+            });
+          }
+          if (s.identity_file) {
+            const resolved = path.resolve(expandHome(s.identity_file));
+            try {
+              const st = await fs.stat(resolved);
+              const otherBits = st.mode & 0o7;
+              if (otherBits & 0o4) {
+                problems.push({
+                  server: s.name,
+                  severity: "warning",
+                  message: `identity_file ${resolved} is world-readable; ssh will refuse to use it. chmod 600.`,
+                });
+              }
+            } catch (err) {
+              problems.push({
+                server: s.name,
+                severity: "error",
+                message: `identity_file ${resolved} not found: ${(err as Error).message}`,
+              });
+            }
+          }
+        }
+        return jsonText({
+          checked: all.length,
+          problems,
+          ok: problems.filter((p) => p.severity === "error").length === 0,
         });
       }),
   );

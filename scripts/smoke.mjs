@@ -104,8 +104,8 @@ try {
 
   const tools = await rpc("tools/list", {});
   assert(
-    tools.result.tools.length >= 15,
-    `tools/list returns at least 15 tools (got ${tools.result.tools.length})`,
+    tools.result.tools.length >= 17,
+    `tools/list returns at least 17 tools (got ${tools.result.tools.length})`,
   );
 
   const info0 = await call("inventory_info", {});
@@ -257,6 +257,31 @@ try {
     newHasIt.keys.includes("api_token"),
     "rename migrates secrets to the new name",
   );
+
+  // ---------- paths_report + validate_inventory ----------
+  const report = await call("paths_report", {});
+  assert(report.inventory.path === inventoryPath, "paths_report.inventory.path matches");
+  assert(report.secrets.path === secretsPath, "paths_report.secrets.path matches");
+  assert(typeof report.secrets.backend === "string", "paths_report.secrets.backend is set");
+  assert(Array.isArray(report.per_server), "paths_report.per_server is an array");
+  assert(
+    report.per_server.some((r) => r.name === "lp-web-1"),
+    "paths_report.per_server lists lp-web-1",
+  );
+
+  // Add a server with a bogus identity_file and validate
+  await call("add_server", {
+    name: "bad-key-server",
+    host: "x.example",
+    identity_file: "/this/path/definitely/does/not/exist",
+    groups: ["test"],
+  });
+  const validation = await call("validate_inventory", {});
+  const badEntry = validation.problems.find(
+    (p) => p.server === "bad-key-server" && p.severity === "error",
+  );
+  assert(!!badEntry, "validate_inventory flags missing identity_file as error");
+  await call("remove_server", { name: "bad-key-server" });
 
   console.log("\nAll smoke checks passed.");
 } catch (err) {

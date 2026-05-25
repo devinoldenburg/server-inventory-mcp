@@ -11,6 +11,17 @@ import {
 } from "./schema.js";
 
 const DEFAULT_PATH = path.join(homedir(), ".config", "server-inventory", "servers.json");
+const DEFAULT_AUDIT_LOG = path.join(homedir(), ".config", "server-inventory", "audit.log");
+
+export function resolveAuditLogPath(): string {
+  const fromEnv = process.env.SERVER_INVENTORY_AUDIT_LOG;
+  if (fromEnv && fromEnv.trim().length > 0) {
+    return fromEnv.startsWith("~")
+      ? path.join(homedir(), fromEnv.slice(1))
+      : fromEnv;
+  }
+  return DEFAULT_AUDIT_LOG;
+}
 
 // Serializes all read-modify-write cycles against the inventory so concurrent
 // MCP tool calls cannot clobber each other.
