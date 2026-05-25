@@ -20,11 +20,23 @@ const inventoryPath = path.join(
   os.tmpdir(),
   `server-inventory-smoke-${process.pid}.json`,
 );
+const secretsPath = path.join(
+  os.tmpdir(),
+  `server-inventory-smoke-${process.pid}.enc`,
+);
 
 await fs.rm(inventoryPath, { force: true });
+await fs.rm(secretsPath, { force: true });
 
 const child = spawn("node", [entry], {
-  env: { ...process.env, SERVER_INVENTORY_PATH: inventoryPath },
+  env: {
+    ...process.env,
+    SERVER_INVENTORY_PATH: inventoryPath,
+    SERVER_INVENTORY_SECRETS_PATH: secretsPath,
+    // Force the env-passphrase backend so the smoke test never touches
+    // the real Keychain on developer machines.
+    SERVER_INVENTORY_PASSPHRASE: "smoke-test-passphrase-" + process.pid,
+  },
   stdio: ["pipe", "pipe", "inherit"],
 });
 
@@ -92,8 +104,8 @@ try {
 
   const tools = await rpc("tools/list", {});
   assert(
-    tools.result.tools.length >= 9,
-    `tools/list returns at least 9 tools (got ${tools.result.tools.length})`,
+    tools.result.tools.length >= 15,
+    `tools/list returns at least 15 tools (got ${tools.result.tools.length})`,
   );
 
   const info0 = await call("inventory_info", {});
@@ -160,6 +172,92 @@ try {
   const finalList = await call("list_servers", {});
   assert(finalList.count === 1, "exactly one server remains");
 
+  // ---------- secrets ----------
+  const secInfo = await call("secrets_info", {});
+  assert(
+    secInfo.backend.startsWith("encrypted-file"),
+    `secrets_info reports encrypted-file backend (got ${secInfo.backend})`,
+  );
+
+  const setRes = await call("set_secret", {
+    server: "lp-web-1",
+    key: "password",
+    value: "hunter2",
+  });
+  assert(setRes.stored === true, "set_secret stores a value");
+  assert(setRes.value_length === 7, "set_secret reports value_length");
+
+  const getRes = await call("get_secret", {
+    server: "lp-web-1",
+    key: "password",
+  });
+  assert(getRes.value === "hunter2", "get_secret round-trips the stored value");
+
+  const missing = await call("get_secret", {
+    server: "lp-web-1",
+    key: "nope",
+  });
+  assert(missing.value === null, "get_secret returns null for missing keys");
+
+  await call("set_secret", { server: "lp-web-1", key: "sudo_password", value: "rootbeer" });
+  // Add lp-other to the inventory before we exercise rename-migrates-secrets
+  // below; setting a secret for a name that has no inventory row is still
+  // legal (e.g. you're about to add the server) but rename works against
+  // the inventory record.
+  await call("add_server", { name: "lp-other", host: "lp-other.example", groups: ["misc"] });
+  await call("set_secret", { server: "lp-other", key: "api_token", value: "abc-123" });
+
+  const listed = await call("list_secrets", { server: "lp-web-1" });
+  assert(listed.count === 2 && listed.keys.includes("password") && listed.keys.includes("sudo_password"),
+    "list_secrets shows both stored keys for lp-web-1");
+
+  const all = await call("list_all_secrets", {});
+  assert(all.servers_with_secrets === 2, "list_all_secrets sees 2 servers");
+  assert(all.total_secret_keys === 3, "list_all_secrets sees 3 keys total");
+
+  // get_server should now include secret keys
+  const gotWithSecrets = await call("get_server", { name: "lp-web-1" });
+  assert(
+    gotWithSecrets.secrets.keys.length === 2,
+    `get_server.secrets.keys lists stored secret names (got ${JSON.stringify(gotWithSecrets.secrets.keys)})`,
+  );
+
+  // list_servers should expose the count
+  const listedAgain = await call("list_servers", {});
+  const lpRow = listedAgain.servers.find((s) => s.name === "lp-web-1");
+  assert(lpRow.secret_count === 2, "list_servers.secret_count reflects stored secrets");
+
+  // Encrypted file must not contain plaintext secrets
+  const fileRaw = await fs.readFile(secretsPath, "utf8");
+  assert(!fileRaw.includes("hunter2"), "secrets file does not contain plaintext password");
+  assert(!fileRaw.includes("rootbeer"), "secrets file does not contain plaintext sudo password");
+  assert(!fileRaw.includes("abc-123"), "secrets file does not contain plaintext api token");
+
+  const del = await call("delete_secret", { server: "lp-web-1", key: "sudo_password" });
+  assert(del.removed === true, "delete_secret removes the key");
+
+  const delMissing = await call("delete_secret", { server: "lp-web-1", key: "sudo_password" });
+  assert(delMissing.removed === false, "delete_secret returns false for missing keys");
+
+  // remove_server should cascade-delete secrets
+  await call("add_server", { name: "lp-doomed", host: "x", groups: ["test"] });
+  await call("set_secret", { server: "lp-doomed", key: "k1", value: "v1" });
+  await call("set_secret", { server: "lp-doomed", key: "k2", value: "v2" });
+  const rm2 = await call("remove_server", { name: "lp-doomed" });
+  assert(rm2.removed_secret_count === 2, "remove_server cascades to delete 2 secrets");
+  const afterCascade = await call("list_secrets", { server: "lp-doomed" });
+  assert(afterCascade.count === 0, "no secrets remain for the removed server");
+
+  // rename should migrate secrets
+  await call("update_server", { name: "lp-other", rename_to: "lp-renamed" });
+  const oldHasNone = await call("list_secrets", { server: "lp-other" });
+  const newHasIt = await call("list_secrets", { server: "lp-renamed" });
+  assert(oldHasNone.count === 0, "rename clears secrets under the old name");
+  assert(
+    newHasIt.keys.includes("api_token"),
+    "rename migrates secrets to the new name",
+  );
+
   console.log("\nAll smoke checks passed.");
 } catch (err) {
   console.error("Smoke test failed:", err.message);
@@ -168,4 +266,5 @@ try {
   child.kill();
   await once(child, "exit").catch(() => {});
   await fs.rm(inventoryPath, { force: true });
+  await fs.rm(secretsPath, { force: true });
 }

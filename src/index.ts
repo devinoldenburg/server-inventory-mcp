@@ -9,12 +9,19 @@ import {
   resolveInventoryPath,
   withInventoryLock,
 } from "./inventory.js";
+import {
+  defaultSecretsStore,
+  resolveSecretsPath,
+  withSecretsLock,
+} from "./secrets.js";
 import type { Server } from "./schema.js";
 
 const PKG_NAME = "server-inventory-mcp";
-const PKG_VERSION = "0.1.0";
+const PKG_VERSION = "0.2.0";
 
-function summary(s: Server) {
+const secrets = defaultSecretsStore();
+
+function summary(s: Server, secretKeyCount = 0) {
   return {
     name: s.name,
     target: buildSshTarget(s),
@@ -23,10 +30,11 @@ function summary(s: Server) {
     environment: s.environment ?? undefined,
     role: s.role ?? undefined,
     description: s.description ?? undefined,
+    secret_count: secretKeyCount,
   };
 }
 
-function detail(s: Server) {
+function detail(s: Server, secretKeys: string[] = []) {
   return {
     name: s.name,
     host: s.host ?? undefined,
@@ -44,6 +52,13 @@ function detail(s: Server) {
     ssh: {
       target: buildSshTarget(s),
       command: buildSshCommand(s),
+    },
+    secrets: {
+      keys: secretKeys,
+      hint:
+        secretKeys.length > 0
+          ? `Call get_secret with this server's name and one of these keys to retrieve a value.`
+          : "No secrets stored for this server.",
     },
   };
 }
@@ -77,11 +92,14 @@ async function main() {
     {
       capabilities: { tools: {} },
       instructions: [
-        "This server keeps an inventory of SSH-reachable machines (grouped + tagged).",
-        "Use list_servers / list_groups to discover hosts (for example: every server in the 'logicplanes' group),",
-        "then call get_server or ssh_target_for to learn the exact ssh target/command,",
-        "and finally connect with the agent's existing ssh tool.",
-        `Inventory file: ${resolveInventoryPath()}`,
+        "This server keeps an inventory of SSH-reachable machines (grouped + tagged) plus",
+        "an encrypted secret store for passwords, sudo passwords, key passphrases, db creds, etc.",
+        "Discovery flow: list_groups / list_tags → list_servers → ssh_target_for or get_server →",
+        "connect with the agent's own ssh tool. If the server has stored secrets (visible as",
+        "secret_count in list_servers and secrets.keys in get_server), retrieve a specific value",
+        "with get_secret RIGHT BEFORE the call that needs it, then pipe it directly into the",
+        "command (e.g. echo \"$pw\" | sudo -S ...). Never echo or persist secret values.",
+        `Inventory file: ${resolveInventoryPath()}. Secrets file: ${resolveSecretsPath()}.`,
       ].join(" "),
     },
   );
@@ -104,7 +122,11 @@ async function main() {
     async (args) =>
       withInventoryLock(async () => {
         const store = await InventoryStore.open();
-        const rows = store.list(args).map(summary);
+        const matched = store.list(args);
+        const secretIndex: Record<string, string[]> = await withSecretsLock(() =>
+          secrets.listAll().catch(() => ({}) as Record<string, string[]>),
+        );
+        const rows = matched.map((s) => summary(s, secretIndex[s.name]?.length ?? 0));
         return jsonText({ count: rows.length, servers: rows });
       }),
   );
@@ -125,7 +147,8 @@ async function main() {
         const store = await InventoryStore.open();
         const s = store.get(name);
         if (!s) return errorText(`Server "${name}" not found.`);
-        return jsonText(detail(s));
+        const secretKeys = await secrets.list(name).catch(() => []);
+        return jsonText(detail(s, secretKeys));
       }),
   );
 
@@ -241,7 +264,8 @@ async function main() {
           tags: args.tags ?? [],
         } as Server);
         await store.save();
-        return jsonText({ added: detail(created) });
+        const secretKeys = await secrets.list(created.name).catch(() => []);
+        return jsonText({ added: detail(created, secretKeys) });
       }),
   );
 
@@ -277,7 +301,22 @@ async function main() {
         if (rename_to !== undefined) patch.name = rename_to;
         const updated = store.update(name, patch);
         await store.save();
-        return jsonText({ updated: detail(updated) });
+        // If renamed, migrate any associated secrets to the new name so
+        // they don't orphan.
+        if (rename_to && rename_to !== name) {
+          await withSecretsLock(async () => {
+            const keys = await secrets.list(name);
+            for (const k of keys) {
+              const v = await secrets.get(name, k);
+              if (v !== null) {
+                await secrets.set(rename_to, k, v);
+                await secrets.delete(name, k);
+              }
+            }
+          });
+        }
+        const secretKeys = await secrets.list(updated.name).catch(() => []);
+        return jsonText({ updated: detail(updated, secretKeys) });
       }),
   );
 
@@ -296,7 +335,14 @@ async function main() {
         const store = await InventoryStore.open();
         const removed = store.remove(name);
         await store.save();
-        return jsonText({ removed: removed.name });
+        // Cascade: drop any secrets associated with this server.
+        const removedSecrets = await withSecretsLock(() =>
+          secrets.deleteServer(name).catch(() => 0),
+        );
+        return jsonText({
+          removed: removed.name,
+          removed_secret_count: removedSecrets,
+        });
       }),
   );
 
@@ -313,12 +359,143 @@ async function main() {
       withInventoryLock(async () => {
         const store = await InventoryStore.open();
         const all = store.all();
+        const secretIndex: Record<string, string[]> = await withSecretsLock(() =>
+          secrets.listAll().catch(() => ({}) as Record<string, string[]>),
+        );
         return jsonText({
-          path: resolveInventoryPath(),
+          inventory_path: resolveInventoryPath(),
+          secrets_path: resolveSecretsPath(),
           server_count: all.length,
           group_count: store.groups().length,
           tag_count: store.tags().length,
+          servers_with_secrets: Object.keys(secretIndex).length,
+          total_secret_keys: Object.values(secretIndex).reduce(
+            (n, arr) => n + arr.length,
+            0,
+          ),
         });
+      }),
+  );
+
+  // ---------- secrets_info ----------
+  server.registerTool(
+    "secrets_info",
+    {
+      title: "Secrets backend info",
+      description:
+        "Where secrets are stored, which encryption backend is in use, and which master-key provider (macOS Keychain or env passphrase). Does NOT reveal any secret values.",
+      inputSchema: {},
+    },
+    async () => {
+      const info = await secrets.describe();
+      return jsonText(info);
+    },
+  );
+
+  // ---------- set_secret ----------
+  server.registerTool(
+    "set_secret",
+    {
+      title: "Store a secret for a server",
+      description:
+        "Encrypt and store a secret value (password, sudo password, API token, key passphrase, ...) for a server. Common keys: password, sudo_password, ssh_passphrase, db_password, api_token. The value is encrypted with AES-256-GCM at rest and never written to the inventory file. Returns only the key that was stored, never the value.",
+      inputSchema: {
+        server: z.string().describe("The server name from the inventory"),
+        key: z
+          .string()
+          .min(1)
+          .describe(
+            "A label for this secret (e.g. 'password', 'sudo_password', 'db_password')",
+          ),
+        value: z.string().min(1).describe("The secret value to encrypt and store"),
+      },
+    },
+    async ({ server: srv, key, value }) =>
+      withSecretsLock(async () => {
+        await secrets.set(srv, key, value);
+        return jsonText({
+          server: srv,
+          key,
+          stored: true,
+          value_length: value.length,
+        });
+      }),
+  );
+
+  // ---------- get_secret ----------
+  server.registerTool(
+    "get_secret",
+    {
+      title: "Retrieve a stored secret",
+      description:
+        "Decrypt and return a secret value for a server. Use this RIGHT BEFORE feeding the value into an ssh / scp / sudo / API call — do not echo the value or persist it elsewhere. Returns null if the key does not exist.",
+      inputSchema: {
+        server: z.string(),
+        key: z.string(),
+      },
+    },
+    async ({ server: srv, key }) =>
+      withSecretsLock(async () => {
+        const value = await secrets.get(srv, key);
+        return jsonText({ server: srv, key, value });
+      }),
+  );
+
+  // ---------- list_secrets ----------
+  server.registerTool(
+    "list_secrets",
+    {
+      title: "List secret keys for a server",
+      description:
+        "List the names (keys) of every secret stored for one server. Values are NEVER returned by this tool — use get_secret with a specific key to fetch a value.",
+      inputSchema: {
+        server: z.string(),
+      },
+    },
+    async ({ server: srv }) =>
+      withSecretsLock(async () => {
+        const keys = await secrets.list(srv);
+        return jsonText({ server: srv, keys, count: keys.length });
+      }),
+  );
+
+  // ---------- list_all_secrets ----------
+  server.registerTool(
+    "list_all_secrets",
+    {
+      title: "List every server's secret keys",
+      description:
+        "Inventory of which servers have which secret KEYS (never the values). Useful for auditing what credentials are stored and finding orphan secrets.",
+      inputSchema: {},
+    },
+    async () =>
+      withSecretsLock(async () => {
+        const all = await secrets.listAll();
+        const totalKeys = Object.values(all).reduce((n, arr) => n + arr.length, 0);
+        return jsonText({
+          servers_with_secrets: Object.keys(all).length,
+          total_secret_keys: totalKeys,
+          by_server: all,
+        });
+      }),
+  );
+
+  // ---------- delete_secret ----------
+  server.registerTool(
+    "delete_secret",
+    {
+      title: "Delete a stored secret",
+      description:
+        "Remove one secret (server + key). Returns { removed: true } if it existed, { removed: false } otherwise.",
+      inputSchema: {
+        server: z.string(),
+        key: z.string(),
+      },
+    },
+    async ({ server: srv, key }) =>
+      withSecretsLock(async () => {
+        const removed = await secrets.delete(srv, key);
+        return jsonText({ server: srv, key, removed });
       }),
   );
 
