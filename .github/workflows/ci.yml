@@ -8,11 +8,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  smoke:
-    name: build + smoke
-    runs-on: ubuntu-latest
+  test:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         node: [20, 22]
     steps:
       - uses: actions/checkout@v4
@@ -22,4 +24,22 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npm test
+      - name: unit tests
+        run: npm run test:unit
+      - name: end-to-end smoke
+        run: npm run smoke
+      - name: CLI smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SERVER_INVENTORY_PATH="$RUNNER_TEMP/cli-inv.json"
+          export SERVER_INVENTORY_SECRETS_PATH="$RUNNER_TEMP/cli-sec.enc"
+          export SERVER_INVENTORY_AUDIT_LOG="$RUNNER_TEMP/cli-aud.log"
+          export SERVER_INVENTORY_PASSPHRASE="ci-passphrase-${{ github.run_id }}"
+          node dist/cli.js info
+          node dist/cli.js add ci-host --host h.example --user u --group ci
+          node dist/cli.js ls --group ci
+          echo -n "s3cret" | node dist/cli.js secret set ci-host token
+          test "$(node dist/cli.js secret get ci-host token)" = "s3cret"
+          node dist/cli.js audit --limit 3
+          node dist/cli.js rm ci-host
