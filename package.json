@@ -1,6 +1,6 @@
 {
   "name": "server-inventory-mcp",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "description": "MCP server that keeps an inventory of SSH-reachable servers (grouped + tagged) so an agent can answer 'audit all <group> servers' by looking up where to connect.",
   "type": "module",
   "bin": {

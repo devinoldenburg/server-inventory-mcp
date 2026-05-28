@@ -287,7 +287,11 @@ export class InventoryStore {
   add(server: Server): Server {
     const normalized = normalizeServer(server);
     if (this.get(normalized.name)) {
-      throw new Error(`Server "${normalized.name}" already exists. Use update_server instead.`);
+      throw new Error(
+        `Server "${normalized.name}" already exists. ` +
+          `If you meant to modify it, call update_server with name "${normalized.name}". ` +
+          `If you're retrying after a network error, call list_servers first to see whether the previous attempt landed.`,
+      );
     }
     this.inv.servers.push(normalized);
     return normalized;
@@ -296,10 +300,16 @@ export class InventoryStore {
   update(name: string, patch: Partial<Server>): Server {
     const existing = this.get(name);
     if (!existing) {
-      throw new Error(`Server "${name}" not found.`);
+      throw new Error(
+        `Server "${name}" not found in the inventory. ` +
+          `Call list_servers to see what's defined, or add_server if "${name}" is a new entry.`,
+      );
     }
     if (patch.name && patch.name !== name && this.get(patch.name)) {
-      throw new Error(`Cannot rename: server "${patch.name}" already exists.`);
+      throw new Error(
+        `Cannot rename "${name}" → "${patch.name}": that name is already taken. ` +
+          `Call list_servers first to pick a free name.`,
+      );
     }
     const merged: Server = {
       ...existing,
@@ -315,7 +325,13 @@ export class InventoryStore {
 
   remove(name: string): Server {
     const idx = this.inv.servers.findIndex((s) => s.name === name);
-    if (idx === -1) throw new Error(`Server "${name}" not found.`);
+    if (idx === -1) {
+      throw new Error(
+        `Server "${name}" not found in the inventory. ` +
+          `Call list_servers to see what's defined. ` +
+          `(If you were trying to delete one secret, use delete_secret, not remove_server.)`,
+      );
+    }
     const [removed] = this.inv.servers.splice(idx, 1);
     return removed;
   }

@@ -1,6 +1,18 @@
 /**
  * Encrypted secrets storage for the inventory.
  *
+ * On-disk envelope (unencrypted JSON wrapper):
+ *   { version: 1, algorithm: "aes-256-gcm", data_version: 2, iv, tag, ciphertext }
+ *
+ * Inside the ciphertext, the JSON map is:
+ *   { server: { key: { value, created_at, updated_at, expires_at? } } }
+ *
+ * Files without `data_version` (or with data_version: 1) carry the older
+ * plain-string shape `{ server: { key: value } }` and are migrated to v2
+ * transparently on read. The migrated shape is persisted on the next
+ * write — there is no eager migration on load, so a pure-read session
+ * leaves the file untouched.
+ *
  * Goals:
  *   - Secret values never appear in the public inventory.json on disk.
  *   - On macOS we anchor the master key in the user's login Keychain so the
@@ -23,8 +35,6 @@ import {
   createDecipheriv,
   timingSafeEqual,
 } from "node:crypto";
-
-// createCipheriv is used in writeAll; the import is intentionally kept.
 
 const exec = promisify(execFile);
 
@@ -79,8 +89,8 @@ export class MacKeychainMasterKey implements MasterKeyProvider {
       this.account,
       "-w",
       key.toString("hex"),
-      "-U", // update if exists (defensive)
-      "-A", // allow all apps to read (so subsequent runs don't prompt)
+      "-U",
+      "-A",
     ]);
     return key;
   }
@@ -132,16 +142,10 @@ export class EnvPassphraseMasterKey implements MasterKeyProvider {
   }
 
   private derive(passphrase: string): Buffer {
-    // Fixed salt → deterministic key. The threat model assumes the file is
-    // not exfiltrated AND the passphrase is strong; if either fails we lose
-    // anyway. Using a fixed salt keeps "set env var on new machine, decrypt
-    // existing file" working.
     const salt = Buffer.from("server-inventory-mcp:v1:scrypt-salt", "utf8");
-    const N = 1 << 15; // 32768
+    const N = 1 << 15;
     const r = 8;
     const p = 1;
-    // Node's default maxmem is 32MB; this scrypt config needs ~33MB.
-    // Bump the cap explicitly so the call doesn't get rejected.
     const maxmem = 64 * 1024 * 1024;
     return scryptSync(passphrase, salt, 32, { N, r, p, maxmem });
   }
@@ -152,48 +156,156 @@ export function defaultMasterKey(): MasterKeyProvider {
     return new EnvPassphraseMasterKey();
   }
   if (platform() === "darwin") return new MacKeychainMasterKey();
-  return new EnvPassphraseMasterKey(); // throws on first use until env is set
+  return new EnvPassphraseMasterKey();
 }
 
-// ---------- secrets store ----------
+// ---------- secrets store: types ----------
 
 export interface SecretsBackendInfo {
   backend: string;
   location: string;
   master_key: string;
   exists: boolean;
+  data_version: number;
+}
+
+/** One stored secret's metadata, never including the plaintext value. */
+export interface SecretMeta {
+  key: string;
+  created_at: string;
+  updated_at: string;
+  expires_at?: string;
+  expired: boolean;
+}
+
+/** Options accepted by set() and updateMeta(). */
+export interface SetSecretOptions {
+  /**
+   * Absolute expiry timestamp as an ISO-8601 string. Pass `null` to clear an
+   * existing expiry. Omit (`undefined`) to leave any existing expiry alone.
+   */
+  expires_at?: string | null;
 }
 
 export interface SecretsStore {
-  set(server: string, key: string, value: string): Promise<void>;
+  set(
+    server: string,
+    key: string,
+    value: string,
+    options?: SetSecretOptions,
+  ): Promise<void>;
   get(server: string, key: string): Promise<string | null>;
+  getMeta(server: string, key: string): Promise<SecretMeta | null>;
   list(server: string): Promise<string[]>;
   listAll(): Promise<Record<string, string[]>>;
+  listMeta(server: string): Promise<SecretMeta[]>;
+  listAllMeta(): Promise<Record<string, SecretMeta[]>>;
   delete(server: string, key: string): Promise<boolean>;
   deleteServer(server: string): Promise<number>;
+  /**
+   * Move every secret from `oldServer` to `newServer` in a single
+   * read/decrypt/encrypt/write cycle. Returns the number of keys moved.
+   * Throws if `newServer` already has any secrets (no silent merging).
+   */
+  rename(oldServer: string, newServer: string): Promise<number>;
   describe(): Promise<SecretsBackendInfo>;
+}
+
+interface SecretEntry {
+  value: string;
+  created_at: string;
+  updated_at: string;
+  expires_at?: string;
 }
 
 interface SecretsFileWrapper {
   version: 1;
   algorithm: "aes-256-gcm";
-  iv: string; // hex (12 bytes)
-  tag: string; // hex (16 bytes)
-  ciphertext: string; // hex
-  // associated data: literal "server-inventory-mcp:v1" — provides domain
-  // separation so the same key can't be tricked into reading an attacker's
-  // ciphertext from a different application.
+  /** Inner-data shape version. Absent on legacy files (== 1). */
+  data_version?: number;
+  iv: string;
+  tag: string;
+  ciphertext: string;
 }
 
 const AAD = Buffer.from("server-inventory-mcp:v1", "utf8");
 
-type SecretsMap = Record<string, Record<string, string>>;
+type SecretsMapV1 = Record<string, Record<string, string>>;
+type SecretsMapV2 = Record<string, Record<string, SecretEntry>>;
+
+/** Latest inner-data shape version. Bump and add a migration when this changes. */
+export const SECRETS_DATA_VERSION = 2;
+
+/**
+ * Sequential migrations applied at read time. Each entry takes data shaped
+ * for version `key` and returns data shaped for version `key + 1`. To add
+ * a future v2→v3 step, append a `2:` entry — readAll walks them in order
+ * until it reaches SECRETS_DATA_VERSION.
+ */
+const SECRETS_MIGRATIONS: Record<
+  number,
+  (data: unknown, now: string) => unknown
+> = {
+  1: (raw, now) => {
+    const old = (raw ?? {}) as SecretsMapV1;
+    const out: SecretsMapV2 = {};
+    for (const [server, keys] of Object.entries(old)) {
+      if (!keys || typeof keys !== "object") continue;
+      out[server] = {};
+      for (const [k, v] of Object.entries(keys)) {
+        if (typeof v !== "string") continue;
+        out[server][k] = { value: v, created_at: now, updated_at: now };
+      }
+    }
+    return out;
+  },
+};
+
+function migrateSecretsData(
+  raw: unknown,
+  fromVersion: number,
+  toVersion: number,
+  now: string,
+): unknown {
+  let data = raw;
+  let v = fromVersion;
+  while (v < toVersion) {
+    const step = SECRETS_MIGRATIONS[v];
+    if (!step) {
+      throw new Error(
+        `No secrets-data migration from version ${v} to ${v + 1}. ` +
+          `Either this client is older than the file, or the file is corrupt.`,
+      );
+    }
+    data = step(data, now);
+    v += 1;
+  }
+  return data;
+}
 
 let secretsChain: Promise<unknown> = Promise.resolve();
 export function withSecretsLock<T>(fn: () => Promise<T>): Promise<T> {
   const next = secretsChain.then(fn, fn);
   secretsChain = next.catch(() => undefined);
   return next;
+}
+
+function isExpired(entry: SecretEntry, nowMs: number): boolean {
+  if (!entry.expires_at) return false;
+  const t = Date.parse(entry.expires_at);
+  if (Number.isNaN(t)) return false;
+  return t <= nowMs;
+}
+
+function toMeta(key: string, entry: SecretEntry, nowMs: number): SecretMeta {
+  const meta: SecretMeta = {
+    key,
+    created_at: entry.created_at,
+    updated_at: entry.updated_at,
+    expired: isExpired(entry, nowMs),
+  };
+  if (entry.expires_at) meta.expires_at = entry.expires_at;
+  return meta;
 }
 
 export class EncryptedFileSecretsStore implements SecretsStore {
@@ -204,7 +316,7 @@ export class EncryptedFileSecretsStore implements SecretsStore {
 
   // ---- low-level encrypted file io ----
 
-  private async readAll(): Promise<SecretsMap> {
+  private async readAll(): Promise<SecretsMapV2> {
     let raw: string;
     try {
       raw = await fs.readFile(this.filePath, "utf8");
@@ -215,12 +327,19 @@ export class EncryptedFileSecretsStore implements SecretsStore {
     const wrapper = JSON.parse(raw) as SecretsFileWrapper;
     if (wrapper.version !== 1) {
       throw new Error(
-        `Unsupported secrets file version: ${wrapper.version}. Expected 1.`,
+        `Unsupported secrets envelope version: ${wrapper.version}. Expected 1.`,
       );
     }
     if (wrapper.algorithm !== "aes-256-gcm") {
       throw new Error(
         `Unsupported algorithm: ${wrapper.algorithm}. Expected aes-256-gcm.`,
+      );
+    }
+    const dataVersion = wrapper.data_version ?? 1;
+    if (dataVersion > SECRETS_DATA_VERSION) {
+      throw new Error(
+        `Secrets file is data_version ${dataVersion} but this client only understands ` +
+          `up to ${SECRETS_DATA_VERSION}. Upgrade server-inventory-mcp.`,
       );
     }
     const key = await this.masterKey.getOrCreate();
@@ -240,10 +359,20 @@ export class EncryptedFileSecretsStore implements SecretsStore {
         "Failed to decrypt secrets file. The master key may be wrong (passphrase changed?) or the file may be corrupt.",
       );
     }
-    return JSON.parse(plain.toString("utf8")) as SecretsMap;
+    const parsed: unknown = JSON.parse(plain.toString("utf8"));
+    if (dataVersion === SECRETS_DATA_VERSION) {
+      return (parsed ?? {}) as SecretsMapV2;
+    }
+    const migrated = migrateSecretsData(
+      parsed,
+      dataVersion,
+      SECRETS_DATA_VERSION,
+      new Date().toISOString(),
+    );
+    return (migrated ?? {}) as SecretsMapV2;
   }
 
-  private async writeAll(map: SecretsMap): Promise<void> {
+  private async writeAll(map: SecretsMapV2): Promise<void> {
     const key = await this.masterKey.getOrCreate();
     if (key.length !== 32) {
       throw new Error(`Master key must be 32 bytes, got ${key.length}.`);
@@ -257,6 +386,7 @@ export class EncryptedFileSecretsStore implements SecretsStore {
     const wrapper: SecretsFileWrapper = {
       version: 1,
       algorithm: "aes-256-gcm",
+      data_version: SECRETS_DATA_VERSION,
       iv: iv.toString("hex"),
       tag: tag.toString("hex"),
       ciphertext: ciphertext.toString("hex"),
@@ -272,21 +402,52 @@ export class EncryptedFileSecretsStore implements SecretsStore {
 
   // ---- public API ----
 
-  async set(server: string, key: string, value: string): Promise<void> {
+  async set(
+    server: string,
+    key: string,
+    value: string,
+    options: SetSecretOptions = {},
+  ): Promise<void> {
     assertId(server, "server");
     assertId(key, "key");
     if (typeof value !== "string" || value.length === 0) {
       throw new Error("Secret value must be a non-empty string.");
     }
+    if (
+      options.expires_at !== undefined &&
+      options.expires_at !== null &&
+      Number.isNaN(Date.parse(options.expires_at))
+    ) {
+      throw new Error(
+        `expires_at must be an ISO-8601 timestamp or null (got ${JSON.stringify(options.expires_at)}).`,
+      );
+    }
     const map = await this.readAll();
+    const now = new Date().toISOString();
     if (!map[server]) map[server] = {};
-    map[server][key] = value;
+    const existing = map[server][key];
+    const next: SecretEntry = existing
+      ? { ...existing, value, updated_at: now }
+      : { value, created_at: now, updated_at: now };
+    if (options.expires_at === null) {
+      delete next.expires_at;
+    } else if (options.expires_at !== undefined) {
+      next.expires_at = new Date(options.expires_at).toISOString();
+    }
+    map[server][key] = next;
     await this.writeAll(map);
   }
 
   async get(server: string, key: string): Promise<string | null> {
     const map = await this.readAll();
-    return map[server]?.[key] ?? null;
+    return map[server]?.[key]?.value ?? null;
+  }
+
+  async getMeta(server: string, key: string): Promise<SecretMeta | null> {
+    const map = await this.readAll();
+    const entry = map[server]?.[key];
+    if (!entry) return null;
+    return toMeta(key, entry, Date.now());
   }
 
   async list(server: string): Promise<string[]> {
@@ -298,6 +459,27 @@ export class EncryptedFileSecretsStore implements SecretsStore {
     const map = await this.readAll();
     const out: Record<string, string[]> = {};
     for (const [s, m] of Object.entries(map)) out[s] = Object.keys(m).sort();
+    return out;
+  }
+
+  async listMeta(server: string): Promise<SecretMeta[]> {
+    const map = await this.readAll();
+    const now = Date.now();
+    const entries = map[server] ?? {};
+    return Object.keys(entries)
+      .sort()
+      .map((k) => toMeta(k, entries[k], now));
+  }
+
+  async listAllMeta(): Promise<Record<string, SecretMeta[]>> {
+    const map = await this.readAll();
+    const now = Date.now();
+    const out: Record<string, SecretMeta[]> = {};
+    for (const [s, entries] of Object.entries(map)) {
+      out[s] = Object.keys(entries)
+        .sort()
+        .map((k) => toMeta(k, entries[k], now));
+    }
     return out;
   }
 
@@ -319,11 +501,38 @@ export class EncryptedFileSecretsStore implements SecretsStore {
     return n;
   }
 
+  async rename(oldServer: string, newServer: string): Promise<number> {
+    assertId(oldServer, "oldServer");
+    assertId(newServer, "newServer");
+    if (oldServer === newServer) return 0;
+    const map = await this.readAll();
+    const existing = map[oldServer];
+    if (!existing || Object.keys(existing).length === 0) return 0;
+    if (map[newServer] && Object.keys(map[newServer]).length > 0) {
+      throw new Error(
+        `Cannot rename secrets ${oldServer} → ${newServer}: ${newServer} already has stored secrets. ` +
+          `Delete them first or rename to a different name.`,
+      );
+    }
+    const moved = Object.keys(existing).length;
+    map[newServer] = existing;
+    delete map[oldServer];
+    await this.writeAll(map);
+    return moved;
+  }
+
   async describe(): Promise<SecretsBackendInfo> {
     let exists = false;
+    let dataVersion = SECRETS_DATA_VERSION;
     try {
-      await fs.access(this.filePath);
+      const raw = await fs.readFile(this.filePath, "utf8");
       exists = true;
+      try {
+        const wrapper = JSON.parse(raw) as SecretsFileWrapper;
+        dataVersion = wrapper.data_version ?? 1;
+      } catch {
+        /* file exists but is unparseable — leave dataVersion at current */
+      }
     } catch {
       /* not yet */
     }
@@ -332,6 +541,7 @@ export class EncryptedFileSecretsStore implements SecretsStore {
       location: this.filePath,
       master_key: this.masterKey.describe(),
       exists,
+      data_version: dataVersion,
     };
   }
 }
@@ -367,6 +577,34 @@ function assertId(value: string, fieldName: string): void {
   if (value.length > 256) {
     throw new Error(`${fieldName} must be 256 characters or fewer.`);
   }
+}
+
+/**
+ * Parse a relative duration like `30d`, `12h`, `45m`, `2w` into an ISO
+ * timestamp `now + duration`. Used by the CLI and MCP tools to accept
+ * `--expires-in 30d` style input without forcing the caller to compute the
+ * absolute timestamp.
+ */
+export function parseExpiresIn(input: string, now: Date = new Date()): string {
+  const m = /^(\d+)\s*([smhdw])$/.exec(input.trim());
+  if (!m) {
+    throw new Error(
+      `Invalid duration "${input}". Use Ns / Nm / Nh / Nd / Nw (e.g. "30d", "12h").`,
+    );
+  }
+  const n = parseInt(m[1], 10);
+  const unit = m[2];
+  const seconds =
+    unit === "s"
+      ? n
+      : unit === "m"
+        ? n * 60
+        : unit === "h"
+          ? n * 3600
+          : unit === "d"
+            ? n * 86400
+            : n * 86400 * 7;
+  return new Date(now.getTime() + seconds * 1000).toISOString();
 }
 
 /**

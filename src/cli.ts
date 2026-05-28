@@ -27,9 +27,14 @@ import {
   resolveAuditLogPath,
   resolveInventoryPath,
 } from "./inventory.js";
-import { defaultSecretsStore, resolveSecretsPath } from "./secrets.js";
+import {
+  defaultSecretsStore,
+  parseExpiresIn,
+  resolveSecretsPath,
+} from "./secrets.js";
 import { buildPathsReport, expandHome, loadSshConfigHostAliases } from "./paths.js";
 import { audit } from "./audit.js";
+import { execEnabled, execOn, sshCheckMany, type SshCheckResult } from "./ssh.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -57,10 +62,23 @@ INVENTORY
   info
 
 SECRETS
-  secret set <server> <key>   # value read from stdin (no echo)
+  secret set <server> <key> [--expires-in DUR | --expires-at ISO]
+                                 # value read from stdin (no echo)
+                                 # DUR examples: 30d, 12h, 2w
   secret get <server> <key>
   secret ls [server]
   secret rm <server> <key>
+
+SSH
+  ssh-check (--name N | --group G | --tag T | --all)
+            [--timeout-sec N] [--parallel N] [--hard-timeout-ms N]
+            # ssh -o BatchMode=yes <target> true, classified per host
+  exec (--name N | --group G | --tag T) [--run] -- <command>
+            [--timeout-sec N] [--hard-timeout-ms N] [--parallel N]
+            [--max-output-bytes N]
+            # Default = dry-run: ssh_check the targets and print the plan,
+            # do not execute. Pass --run to actually fire.
+            # Requires SERVER_INVENTORY_ALLOW_EXEC=1 either way.
 
 AUDIT
   audit [--limit N]            # default 50
@@ -70,6 +88,7 @@ ENVIRONMENT
   SERVER_INVENTORY_SECRETS_PATH override secrets file location
   SERVER_INVENTORY_AUDIT_LOG    override audit log location
   SERVER_INVENTORY_PASSPHRASE   passphrase mode (skip macOS Keychain)
+  SERVER_INVENTORY_ALLOW_EXEC   set to 1 to enable \`exec\` / \`exec_on\`
 `;
 
 function parseArgs(argv: string[]): {
@@ -82,6 +101,13 @@ function parseArgs(argv: string[]): {
   const bool = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    if (a === "--") {
+      // Bash convention: everything after `--` is positional, no flag
+      // parsing. Lets users pass commands with their own --flags to
+      // `exec` without them being eaten here.
+      positional.push(...argv.slice(i + 1));
+      break;
+    }
     if (a.startsWith("--")) {
       const key = a.slice(2);
       const next = argv[i + 1];
@@ -231,17 +257,10 @@ async function cmdUpdate(name: string, args: ReturnType<typeof parseArgs>): Prom
   if (renameTo) (patch as { name?: string }).name = renameTo;
   const updated = store.update(name, patch as never);
   await store.save();
-  // Migrate secrets on rename
+  // Migrate secrets on rename — one file rewrite regardless of how many
+  // keys the server had.
   if (renameTo && renameTo !== name) {
-    const sec = defaultSecretsStore();
-    const keys = await sec.list(name);
-    for (const k of keys) {
-      const v = await sec.get(name, k);
-      if (v !== null) {
-        await sec.set(renameTo, k, v);
-        await sec.delete(name, k);
-      }
-    }
+    await defaultSecretsStore().rename(name, renameTo);
   }
   await audit({ tool: "cli:update_server", server: name, rename_to: renameTo, ok: true });
   jsonOut({ updated });
@@ -335,17 +354,50 @@ async function cmdInfo(): Promise<void> {
   });
 }
 
-async function cmdSecret(sub: string, rest: string[]): Promise<void> {
+async function cmdSecret(args: ReturnType<typeof parseArgs>): Promise<void> {
+  const sub = args.positional[0];
+  if (!sub) throw new Error("Usage: secret <set|get|ls|rm>");
+  const rest = args.positional.slice(1);
   const sec = defaultSecretsStore();
   switch (sub) {
     case "set": {
       const [server, key] = rest;
-      if (!server || !key) throw new Error("Usage: secret set <server> <key>  (value via stdin)");
+      if (!server || !key)
+        throw new Error(
+          "Usage: secret set <server> <key> [--expires-in DUR | --expires-at ISO]  (value via stdin)",
+        );
       const value = await readStdin();
-      if (!value) throw new Error("Empty value on stdin. Pipe the secret in: echo -n 'pw' | server-inv secret set <s> <k>");
-      await sec.set(server, key, value);
-      await audit({ tool: "cli:set_secret", server, key, ok: true });
-      jsonOut({ server, key, stored: true, value_length: value.length });
+      if (!value)
+        throw new Error(
+          "Empty value on stdin. Pipe the secret in: echo -n 'pw' | server-inv secret set <s> <k>",
+        );
+      const expiresAt = f1(args.flags, "expires-at");
+      const expiresIn = f1(args.flags, "expires-in");
+      let absoluteExpiry: string | null | undefined;
+      if (expiresAt !== undefined) {
+        absoluteExpiry = expiresAt === "" ? null : expiresAt;
+      } else if (expiresIn !== undefined) {
+        absoluteExpiry = parseExpiresIn(expiresIn);
+      }
+      await sec.set(server, key, value, { expires_at: absoluteExpiry });
+      const meta = await sec.getMeta(server, key);
+      await audit({
+        tool: "cli:set_secret",
+        server,
+        key,
+        ok: true,
+        extra: meta?.expires_at ? { expires_at: meta.expires_at } : undefined,
+      });
+      jsonOut({
+        server,
+        key,
+        stored: true,
+        value_length: value.length,
+        created_at: meta?.created_at,
+        updated_at: meta?.updated_at,
+        expires_at: meta?.expires_at,
+        expired: meta?.expired ?? false,
+      });
       return;
     }
     case "get": {
@@ -362,10 +414,19 @@ async function cmdSecret(sub: string, rest: string[]): Promise<void> {
     }
     case "ls": {
       const [server] = rest;
+      const wantMeta = args.bool.has("meta");
       if (server) {
-        jsonOut({ server, keys: await sec.list(server) });
+        if (wantMeta) {
+          jsonOut({ server, entries: await sec.listMeta(server) });
+        } else {
+          jsonOut({ server, keys: await sec.list(server) });
+        }
       } else {
-        jsonOut({ by_server: await sec.listAll() });
+        if (wantMeta) {
+          jsonOut({ by_server_meta: await sec.listAllMeta() });
+        } else {
+          jsonOut({ by_server: await sec.listAll() });
+        }
       }
       return;
     }
@@ -387,6 +448,161 @@ async function cmdSecret(sub: string, rest: string[]): Promise<void> {
     default:
       throw new Error(`Unknown secret subcommand: ${sub}`);
   }
+}
+
+async function cmdSshCheck(args: ReturnType<typeof parseArgs>): Promise<void> {
+  const store = await InventoryStore.open();
+  const name = f1(args.flags, "name");
+  const group = f1(args.flags, "group");
+  const tag = f1(args.flags, "tag");
+  const all = args.bool.has("all");
+  const provided = [name, group, tag, all ? "all" : undefined].filter(Boolean).length;
+  if (provided !== 1) {
+    throw new Error("Provide exactly one of --name, --group, --tag, --all.");
+  }
+  let targets;
+  if (name) {
+    const s = store.get(name);
+    if (!s) throw new Error(`Server "${name}" not found.`);
+    targets = [s];
+  } else if (group) {
+    targets = store.list({ group });
+  } else if (tag) {
+    targets = store.list({ tag });
+  } else {
+    targets = store.all();
+  }
+  if (targets.length === 0) {
+    jsonOut({ count: 0, results: [], by_outcome: {} });
+    return;
+  }
+  const connectTimeoutSec = numFlag(args, "timeout-sec");
+  const hardTimeoutMs = numFlag(args, "hard-timeout-ms");
+  const parallel = numFlag(args, "parallel");
+  const results = await sshCheckMany(targets, {
+    connect_timeout_sec: connectTimeoutSec,
+    hard_timeout_ms: hardTimeoutMs,
+    parallel,
+  });
+  const byOutcome: Record<string, number> = {};
+  for (const r of results) byOutcome[r.outcome] = (byOutcome[r.outcome] ?? 0) + 1;
+  jsonOut({
+    count: results.length,
+    ok_count: byOutcome.ok ?? 0,
+    by_outcome: byOutcome,
+    results,
+  });
+  // Make `ssh-check` script-friendly: non-zero exit if any host wasn't ok.
+  if ((byOutcome.ok ?? 0) !== results.length) {
+    process.exitCode = 1;
+  }
+}
+
+async function cmdExec(args: ReturnType<typeof parseArgs>): Promise<void> {
+  if (!execEnabled()) {
+    throw new Error(
+      "exec is disabled. Set SERVER_INVENTORY_ALLOW_EXEC=1 in the environment to enable it.",
+    );
+  }
+  const command = args.positional.join(" ");
+  if (!command) throw new Error("Usage: exec (--name N | --group G | --tag T) [--run] <command>");
+  const store = await InventoryStore.open();
+  const name = f1(args.flags, "name");
+  const group = f1(args.flags, "group");
+  const tag = f1(args.flags, "tag");
+  const provided = [name, group, tag].filter(Boolean).length;
+  if (provided !== 1) {
+    throw new Error("Provide exactly one of --name, --group, --tag.");
+  }
+  let targets;
+  if (name) {
+    const s = store.get(name);
+    if (!s) throw new Error(`Server "${name}" not found. Try: server-inv ls`);
+    targets = [s];
+  } else if (group) {
+    targets = store.list({ group });
+  } else {
+    targets = store.list({ tag });
+  }
+  if (targets.length === 0) {
+    throw new Error("No matching servers. Try: server-inv groups / server-inv tags");
+  }
+
+  // Mirror the MCP default: dry-run unless --run is explicitly passed.
+  // Keeps human and agent flows on the same rails — same audit footprint,
+  // same blast-radius preview, same surprise budget.
+  const wantRun = args.bool.has("run");
+  if (!wantRun) {
+    const probe = await sshCheckMany(targets, {
+      connect_timeout_sec: numFlag(args, "timeout-sec"),
+      hard_timeout_ms: numFlag(args, "hard-timeout-ms"),
+      parallel: numFlag(args, "parallel"),
+    });
+    const byOutcome: Record<string, number> = {};
+    for (const r of probe as SshCheckResult[]) byOutcome[r.outcome] = (byOutcome[r.outcome] ?? 0) + 1;
+    const okCount = byOutcome.ok ?? 0;
+    await audit({
+      tool: "cli:exec_on:dry_run",
+      ok: true,
+      extra: { target_count: targets.length, ok_count: okCount },
+    });
+    jsonOut({
+      dry_run: true,
+      target_count: targets.length,
+      would_run: command,
+      reachable_count: okCount,
+      unreachable_count: targets.length - okCount,
+      by_outcome: byOutcome,
+      reachability: probe.map((r) => ({
+        name: r.name,
+        target: r.target,
+        outcome: r.outcome,
+        message: r.message,
+      })),
+      next_step:
+        okCount === 0
+          ? "Zero reachable hosts. Fix connectivity before re-running with --run."
+          : `${okCount} of ${targets.length} reachable. Re-run with --run to execute.`,
+    });
+    if (okCount === 0) process.exitCode = 1;
+    return;
+  }
+
+  const results = await execOn(targets, command, {
+    connect_timeout_sec: numFlag(args, "timeout-sec"),
+    hard_timeout_ms: numFlag(args, "hard-timeout-ms"),
+    parallel: numFlag(args, "parallel"),
+    max_output_bytes: numFlag(args, "max-output-bytes"),
+  });
+  for (const r of results) {
+    await audit({
+      tool: "cli:exec_on",
+      server: r.name,
+      ok: r.ok,
+      extra: {
+        exit_code: r.exit_code,
+        duration_ms: r.duration_ms,
+        timed_out: r.timed_out,
+      },
+    });
+  }
+  const okCount = results.filter((r) => r.ok).length;
+  jsonOut({
+    dry_run: false,
+    count: results.length,
+    ok_count: okCount,
+    fail_count: results.length - okCount,
+    results,
+  });
+  if (okCount !== results.length) process.exitCode = 1;
+}
+
+function numFlag(args: ReturnType<typeof parseArgs>, key: string): number | undefined {
+  const v = f1(args.flags, key);
+  if (v === undefined) return undefined;
+  const n = parseInt(v, 10);
+  if (Number.isNaN(n)) throw new Error(`--${key} must be a number, got "${v}".`);
+  return n;
 }
 
 async function cmdAudit(args: ReturnType<typeof parseArgs>): Promise<void> {
@@ -448,7 +664,12 @@ async function main(): Promise<void> {
     case "info":
       return cmdInfo();
     case "secret":
-      return cmdSecret(args.positional[0] ?? throwUsage("secret <set|get|ls|rm>"), args.positional.slice(1));
+      return cmdSecret(args);
+    case "ssh-check":
+    case "check":
+      return cmdSshCheck(args);
+    case "exec":
+      return cmdExec(args);
     case "audit":
       return cmdAudit(args);
     default:

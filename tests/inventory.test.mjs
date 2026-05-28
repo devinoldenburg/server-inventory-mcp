@@ -216,6 +216,6 @@ test("update fails on rename collision", async () => {
   const store = await InventoryStore.open(p);
   store.add({ name: "a", host: "x", groups: [], tags: [] });
   store.add({ name: "b", host: "x", groups: [], tags: [] });
-  assert.throws(() => store.update("a", { name: "b" }), /already exists/);
+  assert.throws(() => store.update("a", { name: "b" }), /already taken/);
   await fs.rm(p, { force: true });
 });

@@ -49,6 +49,48 @@ server installed it can:
 
 You never have to dictate where things live.
 
+### Agent-friendly defaults (because agents make mistakes)
+
+This server is designed to be safe for an LLM agent to drive. The mistakes
+LLMs actually make in the wild are inlined into the tool surface so the agent
+sees the warning at the moment of the call, not in a README it might not have
+been given:
+
+| Mistake the tool guards against | How |
+|--------------------------------|------|
+| Calling `add_server` twice on a retry | Hard error on duplicate name, suggesting `update_server` in the error body. |
+| Confusing `delete_secret` (one key) with `remove_server` (whole entry + cascaded secrets) | Both descriptions cross-reference each other with "Mistakes to avoid:" callouts. |
+| Echoing a `get_secret` value back to the user | `get_secret` description explicitly forbids it; instructions block repeats it. |
+| Inlining a secret on a command line | Both `get_secret` and `exec_on` warn against this and tell the agent to pipe via stdin. |
+| Firing `exec_on` across a wide group without checking | `exec_on` defaults to `dry_run: true` — first call returns reachability + the plan, second call (with `dry_run: false`) actually runs. |
+| Rebuilding ssh commands from `host`/`user`/`port` | `ssh_target_for` returns a ready-to-run command string; description tells the agent to use it verbatim. |
+| Proceeding past `isError: true` | The MCP `instructions` block explicitly says to treat `isError` results as not having happened. |
+| Reusing stale `list_servers` output across mutations | Instructions block says re-read after every CRUD call. |
+
+The MCP server's `instructions` block (delivered to the client during the
+handshake) lays out the intended flow and an explicit "agents make mistakes —
+here are the ones we've seen" section. Tool descriptions repeat the warnings
+inline so they survive context compression.
+
+### Going one step further: `ssh_check` and `exec_on`
+
+The inventory tells the agent *where* to connect. Two further tools let it
+actually act:
+
+- **`ssh_check`** — non-interactive reachability probe. Pass a name / group
+  / tag (or omit all three to probe the whole inventory) and get back a
+  classified outcome per host: `ok` / `auth_failed` / `dns_failure` /
+  `refused` / `timeout` / `host_key_mismatch` / `unreachable` / `unknown`.
+  Bounded parallelism. Use this before kicking off a long audit so dead
+  hosts and auth problems surface in seconds, not minutes.
+
+- **`exec_on`** — run a single non-interactive command across a group and
+  collect `{exit_code, stdout, stderr, duration_ms}` per host. **Strictly
+  opt-in**: refuses unless `SERVER_INVENTORY_ALLOW_EXEC=1` is set in the
+  MCP server's environment. Output is truncated per host (default 4 KB
+  each). The audit log records the server name and exit code only —
+  never the command body, never the output (both can contain credentials).
+
 ## Install
 
 Requires Node.js 20+.
@@ -109,6 +151,7 @@ defaults below.
 | Master key      | macOS Keychain (`security`) on darwin, otherwise derived from `SERVER_INVENTORY_PASSPHRASE` via scrypt | — |
 | Identity files  | wherever you keep them in `~/.ssh/` — the inventory references them by absolute or `~/` path | — |
 | SSH config      | `~/.ssh/config` — owned entirely by you, never modified by this server | — |
+| `exec_on` gate  | off by default; set `SERVER_INVENTORY_ALLOW_EXEC=1` in the MCP server's environment to enable arbitrary remote command execution. Off elsewhere. | `SERVER_INVENTORY_ALLOW_EXEC` |
 
 All files except `~/.ssh/config` are created with mode `0600`.
 
@@ -128,7 +171,13 @@ All files except `~/.ssh/config` are created with mode `0600`.
                               ▼
    ┌──────────────────────────────────────────────────┐
    │  modify the in-memory map                         │
-   │  { "lp-web-1": { "password": "..." } }            │
+   │  { "lp-web-1": {                                  │
+   │     "password": {                                 │
+   │        "value": "...",                            │
+   │        "created_at": "...",                       │
+   │        "updated_at": "...",                       │
+   │        "expires_at": "..."  (optional)            │
+   │  }}}                                              │
    └──────────────────────────────────────────────────┘
                               │
                               ▼
@@ -170,12 +219,14 @@ you grep `audit.log` for a secret string, you'll never find it.
 | `ssh_target_for` | Resolve a name OR group OR tag to ssh commands. |
 | `add_server` / `update_server` / `remove_server` | CRUD. `remove_server` cascades to delete secrets; `update_server` with `rename_to` migrates them. |
 | `secrets_info` | Backend + master-key provider + secrets file path. |
-| `set_secret` | Encrypt + store one value. |
+| `set_secret` | Encrypt + store one value. Accepts `expires_at` (ISO) or `expires_in` (`30d`, `12h`, `2w`); preserves `created_at` across updates. Returns metadata, never the value. |
 | `get_secret` | Decrypt + return one value. Call this right before the command that needs it. |
-| `list_secrets` | Keys for one server (never values). |
-| `list_all_secrets` | Every server's keys (never values). |
+| `list_secrets` | Keys for one server **with metadata** (`created_at`, `updated_at`, optional `expires_at`, `expired`). Values are never returned. |
+| `list_all_secrets` | Every server's keys with metadata + an `expired_count`. |
 | `delete_secret` | Remove one key. |
 | `audit_tail` | Last N entries from the audit log. |
+| `ssh_check` | Probe reachability per host (`ssh -o BatchMode=yes <target> true`) with structured outcomes: `ok` / `auth_failed` / `dns_failure` / `refused` / `timeout` / `host_key_mismatch` / `unreachable` / `unknown`. Bounded parallelism, ConnectTimeout, hard kill timer. |
+| `exec_on` | Run a non-interactive command across name / group / tag and return per-host `{exit_code, stdout, stderr, duration_ms}`. **Opt-in**: refuses unless `SERVER_INVENTORY_ALLOW_EXEC=1`. **Defaults to `dry_run: true`** — first call returns reachability + the plan; pass `dry_run: false` to actually run. Output truncated; audit log records server + exit code only. |
 
 ## The CLI
 
@@ -193,9 +244,18 @@ server-inv update lp-web-1 --port 2222 --tag tls
 server-inv update lp-web-1 --rename-to lp-web-primary
 
 echo -n 'hunter2' | server-inv secret set lp-web-1 password
+echo -n 'tok-abc' | server-inv secret set lp-web-1 api_token --expires-in 30d
 server-inv secret get lp-web-1 password   # prints value to stdout
 server-inv secret ls                       # all servers' keys
+server-inv secret ls lp-web-1 --meta       # keys + created_at/updated_at/expires_at
 server-inv secret rm lp-web-1 password
+
+server-inv ssh-check --group logicplanes   # probe every host, non-zero exit if any down
+server-inv ssh-check --all --timeout-sec 3
+SERVER_INVENTORY_ALLOW_EXEC=1 \
+  server-inv exec --group logicplanes -- "uptime && uname -r"   # dry-run by default
+SERVER_INVENTORY_ALLOW_EXEC=1 \
+  server-inv exec --group logicplanes --run -- "uptime && uname -r"   # actually fire
 
 server-inv paths                       # paths_report as JSON
 server-inv validate                    # validate_inventory as JSON
@@ -255,8 +315,10 @@ What this server is good for:
 
 What it is **not**:
 
-- A team password manager. There's no sharing, no rotation policy, no
-  expiry. Use 1Password / Bitwarden / Vault if you need that.
+- A team password manager. There's no sharing, no rotation policy. Per-key
+  `expires_at` is a reminder mechanism (surfaced through `list_secrets` and
+  `validate_inventory`); it does NOT delete or rotate the value. Use
+  1Password / Bitwarden / Vault for actual team credential management.
 - An access-control system. Anything that can talk to this MCP server
   can read all the secrets. Don't expose it over the network.
 - Tamper-proof. The audit log is on disk and can be deleted. If you

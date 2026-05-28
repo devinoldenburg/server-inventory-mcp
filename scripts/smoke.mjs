@@ -110,9 +110,12 @@ try {
 
   const tools = await rpc("tools/list", {});
   assert(
-    tools.result.tools.length >= 18,
-    `tools/list returns at least 18 tools (got ${tools.result.tools.length})`,
+    tools.result.tools.length >= 20,
+    `tools/list returns at least 20 tools (got ${tools.result.tools.length})`,
   );
+  const toolNames = new Set(tools.result.tools.map((t) => t.name));
+  assert(toolNames.has("ssh_check"), "tools/list includes ssh_check");
+  assert(toolNames.has("exec_on"), "tools/list includes exec_on");
 
   const info0 = await call("inventory_info", {});
   assert(info0.server_count === 0, "starts with an empty inventory");
@@ -288,6 +291,104 @@ try {
   );
   assert(!!badEntry, "validate_inventory flags missing identity_file as error");
   await call("remove_server", { name: "bad-key-server" });
+
+  // ---------- secret metadata + expiry ----------
+  const metaRes = await call("set_secret", {
+    server: "lp-web-1",
+    key: "rotated_token",
+    value: "shhh-rotate-me",
+    expires_in: "30d",
+  });
+  assert(
+    typeof metaRes.created_at === "string" && typeof metaRes.updated_at === "string",
+    "set_secret returns created_at + updated_at",
+  );
+  assert(typeof metaRes.expires_at === "string", "set_secret with expires_in returns expires_at");
+  assert(metaRes.expired === false, "freshly-set secret with future expiry is not expired");
+
+  // Updating preserves created_at and bumps updated_at.
+  const meta2 = await call("set_secret", {
+    server: "lp-web-1",
+    key: "rotated_token",
+    value: "shhh-again",
+  });
+  assert(meta2.created_at === metaRes.created_at, "update preserves created_at");
+  assert(meta2.updated_at !== metaRes.updated_at, "update bumps updated_at");
+
+  // list_secrets now exposes metadata as well as the raw key list.
+  const listed2 = await call("list_secrets", { server: "lp-web-1" });
+  assert(
+    Array.isArray(listed2.entries) && listed2.entries.some((e) => e.key === "rotated_token"),
+    "list_secrets.entries carries per-key metadata",
+  );
+
+  // Expired credentials should be flagged by validate_inventory.
+  const longAgo = new Date(Date.now() - 86_400_000).toISOString();
+  await call("set_secret", {
+    server: "lp-web-1",
+    key: "stale_creds",
+    value: "x",
+    expires_at: longAgo,
+  });
+  const validationExpired = await call("validate_inventory", {});
+  assert(
+    validationExpired.problems.some(
+      (p) => p.server === "lp-web-1" && /expired/i.test(p.message),
+    ),
+    "validate_inventory flags expired secrets",
+  );
+  await call("delete_secret", { server: "lp-web-1", key: "stale_creds" });
+  await call("delete_secret", { server: "lp-web-1", key: "rotated_token" });
+
+  // ---------- ssh_check ----------
+  // .invalid is RFC 2606 — guaranteed never to resolve, fast DNS failure.
+  await call("add_server", {
+    name: "unreachable",
+    host: "nope.invalid",
+    groups: ["smoke"],
+  });
+  const probe = await call("ssh_check", {
+    name: "unreachable",
+    connect_timeout_sec: 2,
+    hard_timeout_ms: 8000,
+  });
+  assert(probe.count === 1, "ssh_check returns one result for a single target");
+  const probeResult = probe.results[0];
+  assert(
+    probeResult.outcome !== "ok",
+    `ssh_check on .invalid should not be ok (got ${probeResult.outcome})`,
+  );
+  // The dns_failure path is the most common verdict, but on some sandboxed
+  // CI runners ssh may report timeout instead. Accept either as long as the
+  // classification ran.
+  assert(
+    ["dns_failure", "timeout", "unreachable", "unknown"].includes(probeResult.outcome),
+    `ssh_check classified the failure (got ${probeResult.outcome})`,
+  );
+  await call("remove_server", { name: "unreachable" });
+
+  // ---------- exec_on (gated) ----------
+  const execRefused = await call("exec_on", {
+    name: "lp-web-1",
+    command: "true",
+  });
+  assert(
+    typeof execRefused.error === "string" && /SERVER_INVENTORY_ALLOW_EXEC/.test(execRefused.error),
+    "exec_on refuses without SERVER_INVENTORY_ALLOW_EXEC (dry_run unspecified)",
+  );
+  // The gate also applies when dry_run is explicitly requested — the dry
+  // run is informative but still requires the operator to have enabled the
+  // tool. This keeps the threat model simple: ALLOW_EXEC controls whether
+  // the tool is functional at all.
+  const dryRefused = await call("exec_on", {
+    name: "lp-web-1",
+    command: "true",
+    dry_run: true,
+  });
+  assert(
+    typeof dryRefused.error === "string" && /SERVER_INVENTORY_ALLOW_EXEC/.test(dryRefused.error),
+    "exec_on dry_run also gated by ALLOW_EXEC",
+  );
 
   // ---------- audit log ----------
   const tail = await call("audit_tail", { limit: 200 });
